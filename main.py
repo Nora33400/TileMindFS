@@ -1,13 +1,31 @@
-
 import argparse
+import logging
+from pathlib import Path
+
 from engine import TileStore
 from optimizer import Optimizer
+from tilemindfs.config import load_config
+from tilemindfs.dispatcher import Dispatcher
+from tilemindfs.explanations import LEVELS, explain_all, explain_level
+from tilemindfs.git_sync import dual_remote_plan, render_plan
+from tilemindfs.logging_utils import configure_logging
+from tilemindfs.models import BudgetModel, CoherenceModel, ScoreEngine
+from tilemindfs.planner import Planner, load_jobs, plan_to_json, plan_to_text
 
-def main():
+
+def _emit_plan_output(rendered: str, output_path: str | None) -> None:
+    print(rendered)
+    if output_path:
+        Path(output_path).write_text(rendered + "\n", encoding="utf-8")
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(
-        prog="TileMindFS",
-        description="Tile-based dedup + compression storage (MVP V2)."
+        prog="tilemindfs",
+        description="Tile-based dedup + resource-aware dry-run planner.",
     )
+    parser.add_argument("--config", default="config.yaml", help="Path to YAML configuration")
+
     sub = parser.add_subparsers(dest="command")
 
     store_p = sub.add_parser("store", help="Store a file into tiles")
@@ -22,19 +40,77 @@ def main():
     opt_p = sub.add_parser("optimize", help="Run optimizer loop")
     opt_p.add_argument("--interval", type=int, default=5)
 
+    plan_p = sub.add_parser("plan", help="Create manual-guided dry-run plan")
+    plan_p.add_argument("--jobs", required=True, help="JSON file containing candidate jobs")
+    plan_p.add_argument("--dry-run", action="store_true", help="Required safety switch; planner never executes")
+    plan_p.add_argument("--resource-limit", type=float, default=None, help="Override budget limit from config")
+    plan_p.add_argument("--top-k", type=int, default=None, help="Override top-k from config")
+    plan_p.add_argument("--output", choices=["text", "json"], default="text")
+    plan_p.add_argument("--save", default=None, help="Optional file path to save rendered plan output")
+    plan_p.add_argument("--min-score", type=float, default=None, help="Optional minimum score threshold")
+
+    sync_p = sub.add_parser("sync-help", help="Print commands to sync branch to ErrorCat04 and Nora33400")
+    sync_p.add_argument("--branch", default="work")
+    sync_p.add_argument("--errorcat-repo", default="https://github.com/ErrorCat04/TileMindFS.git")
+    sync_p.add_argument("--nora-repo", default="https://github.com/Nora33400/TileMindFS.git")
+
+    explain_p = sub.add_parser("explain", help="Explain TileMindFS in natural language")
+    explain_p.add_argument("--level", choices=[*LEVELS, "all"], default="all")
+
     args = parser.parse_args()
-    store = TileStore()
+
+    if args.command in {"plan", "optimize"}:
+        cfg = load_config(args.config)
+        configure_logging(cfg.logging.level)
+        logger = logging.getLogger("tilemindfs.cli")
+    else:
+        cfg = None
+        logger = None
 
     if args.command == "store":
-        print(store.store_file(args.file))
+        print(TileStore().store_file(args.file))
     elif args.command == "reconstruct":
-        print(store.reconstruct_file(args.original, args.output))
+        print(TileStore().reconstruct_file(args.original, args.output))
     elif args.command == "report":
-        print(store.report())
+        print(TileStore().report())
     elif args.command == "optimize":
         Optimizer().run_loop(args.interval)
+    elif args.command == "plan":
+        if not args.dry_run:
+            parser.error("Manual-guided mode only: pass --dry-run")
+
+        jobs = load_jobs(args.jobs)
+        score_engine = ScoreEngine(cfg.weights, CoherenceModel())
+        planner = Planner(score_engine, Dispatcher(BudgetModel()))
+
+        limit = args.resource_limit if args.resource_limit is not None else cfg.budget.default_resource_limit
+        top_k = args.top_k if args.top_k is not None else cfg.planner.default_top_k
+
+        result = planner.plan(
+            jobs=jobs,
+            resource_limit=limit,
+            top_k=top_k,
+            min_score=args.min_score,
+        )
+        logger.info(
+            "dry-run plan generated count_selected=%s total_resource=%s",
+            len(result.selected),
+            result.total_resource,
+        )
+        rendered = plan_to_json(result) if args.output == "json" else plan_to_text(result)
+        _emit_plan_output(rendered, args.save)
+    elif args.command == "sync-help":
+        plan = dual_remote_plan(args.errorcat_repo, args.nora_repo, args.branch)
+        print(render_plan(plan))
+    elif args.command == "explain":
+        if args.level == "all":
+            for level, text in explain_all().items():
+                print(f"[{level}]\n{text}\n")
+        else:
+            print(explain_level(args.level))
     else:
         parser.print_help()
+
 
 if __name__ == "__main__":
     main()
