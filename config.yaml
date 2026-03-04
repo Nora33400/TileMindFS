@@ -1,0 +1,12 @@
+seed: 42
+logging:
+  level: INFO
+weights:
+  lambda: 0.45
+  mu: 0.20
+  rho: 0.25
+  eta: 0.10
+budget:
+  default_resource_limit: 10.0
+planner:
+  default_top_k: 3
